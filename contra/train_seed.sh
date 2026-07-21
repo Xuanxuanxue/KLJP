@@ -1,8 +1,8 @@
 #!/bin/bash
-# params=("5","17","67","76","81")
-python /data/zhang/liang/KLJP/contra/train_bl.py --seed 5
-python /data/zhang/liang/KLJP/contra/train_bl.py --seed 17
-python /data/zhang/liang/KLJP/contra/train_bl.py --seed 67
-python /data/zhang/liang/KLJP/contra/train_bl.py --seed 76
-python /data/zhang/liang/KLJP/contra/train_bl.py --seed 81
+# The script works from any checkout; paths are resolved by setting.py.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODE="${KLJP_MODE:-auto}"
 
+for seed in 5 17 67 76 81; do
+    python "${SCRIPT_DIR}/train_bl.py" --mode "${MODE}" --seed "${seed}"
+done

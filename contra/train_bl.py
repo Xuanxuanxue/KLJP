@@ -26,7 +26,9 @@ from setting import (BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEV_FILE, DEVICE,
                      EMB_DIM, EMBEDDING_PATH, EPOCHS, HEAD, HID_DIM, LCM,
                      MODEL, PRETRAIN, SEQ_LEN, SMOOTH, TEST_FILE, TRAIN_FILE,
                      BERT_MODEL_NAME, ELECTRA_MODEL_NAME, LABEL_DETAILS_ROOT,
-                     PROJECT_ROOT, LOG_ROOT)
+                     PROJECT_ROOT, LOG_ROOT, NUM_WORKERS, PIN_MEMORY,
+                     RUNTIME_MODE, RUNTIME_MODE_REASON, DATA_ROOT,
+                     LOCAL_ELECTRA_MODEL_PATH, ALLOW_MODEL_DOWNLOAD, CACHE_ROOT)
 from sklearn.metrics import (classification_report, f1_score, jaccard_score,
                              multilabel_confusion_matrix,
                              precision_recall_fscore_support)
@@ -40,6 +42,24 @@ from transformers import AutoTokenizer, BertTokenizer
 # from data_loader4ee import RANDOM_SEED,simple_load_multi_data
 # import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
+
+
+def validate_runtime_paths():
+    required_data_files = (TRAIN_FILE, DEV_FILE, TEST_FILE)
+    missing_data_files = [path for path in required_data_files if not path.is_file()]
+    if missing_data_files:
+        missing = "\n".join(f"- {path}" for path in missing_data_files)
+        raise FileNotFoundError(
+            f"{RUNTIME_MODE} 模式缺少数据集文件：\n{missing}\n"
+            "可通过 KLJP_DATA_ROOT 指定 Ubuntu 中的数据目录。"
+        )
+
+    if PRETRAIN and not LOCAL_ELECTRA_MODEL_PATH.is_dir() and not ALLOW_MODEL_DOWNLOAD:
+        raise FileNotFoundError(
+            "服务器模式禁止联网下载模型，但本地 Electra 目录不存在：\n"
+            f"- {LOCAL_ELECTRA_MODEL_PATH}\n"
+            "请检查 /mntF 挂载，或通过 KLJP_ELECTRA_PATH 指定实际目录。"
+        )
 
 
 def build_logger(name, log_file):
@@ -71,7 +91,10 @@ def setup_seed(seed):
 def set_args():
     """设置训练模型所需参数"""
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--device', default='0', type=str, help='设置训练或测试时使用的显卡')
+    parser.add_argument(
+        '--mode', choices=('auto', 'local', 'server'), default=RUNTIME_MODE,
+        help='运行模式；auto 会根据环境自动判断，也可用 KLJP_MODE 覆盖',
+    )
     parser.add_argument('--seed', type=int, default=22, help='随机种子')
     parser.add_argument('--log-interval', type=int, default=50,
                         help='每隔多少个训练 batch 记录一次日志')
@@ -80,6 +103,7 @@ def set_args():
 class Trainer:
     def __init__(self,load_path=None):
         args = set_args()
+        validate_runtime_paths()
         setup_seed(args.seed)
         article_details_path = LABEL_DETAILS_ROOT / "law.json"
         charge_details_path = LABEL_DETAILS_ROOT / "charge_details.json"
@@ -112,13 +136,16 @@ class Trainer:
         self.test_set,_=simple_load_multi_data(TEST_FILE,SEQ_LEN,EMBEDDING_PATH,text_clean=False)
         self.train_iter=DataLoader(
             self.train_set, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
-            collate_fn=self.train_set.collate_fn)
+            collate_fn=self.train_set.collate_fn, num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY, persistent_workers=NUM_WORKERS > 0)
         self.dev_iter=DataLoader(
             self.valid_set, batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
-            collate_fn=self.valid_set.collate_fn)
+            collate_fn=self.valid_set.collate_fn, num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY, persistent_workers=NUM_WORKERS > 0)
         self.test_iter=DataLoader(
             self.test_set, batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
-            collate_fn=self.test_set.collate_fn)
+            collate_fn=self.test_set.collate_fn, num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY, persistent_workers=NUM_WORKERS > 0)
         
         if MODEL=="Bert":
             self.tokenizer_view=BertTokenizer.from_pretrained(BERT_MODEL_NAME)
@@ -157,8 +184,8 @@ class Trainer:
         self._write_config(parameter_count)
         self.train_logger.info(
             "初始化完成 | model=%s | parameters=%d | device=%s | "
-            "epochs=%d | batch_size=%d | train/valid/test=%d/%d/%d",
-            MODEL, parameter_count, DEVICE, self.epochs, BATCH_SIZE,
+            "mode=%s | epochs=%d | batch_size=%d | train/valid/test=%d/%d/%d",
+            MODEL, parameter_count, DEVICE, RUNTIME_MODE, self.epochs, BATCH_SIZE,
             len(self.train_set), len(self.valid_set), len(self.test_set),
         )
         # ignored_params = list(map(id, self.model.electra.parameters()))
@@ -171,11 +198,20 @@ class Trainer:
             "run_id": self.run_id,
             "model": MODEL,
             "model_name": self.model_name,
+            "runtime_mode": RUNTIME_MODE,
+            "runtime_mode_reason": RUNTIME_MODE_REASON,
+            "data_root": str(DATA_ROOT),
+            "cache_root": str(CACHE_ROOT),
+            "log_root": str(LOG_ROOT),
             "pretrained_model": get_electra_source() if PRETRAIN else None,
+            "configured_electra_path": str(LOCAL_ELECTRA_MODEL_PATH),
+            "allow_model_download": ALLOW_MODEL_DOWNLOAD,
             "device": str(DEVICE),
             "seed": self.seed,
             "epochs": self.epochs,
             "batch_size": BATCH_SIZE,
+            "num_workers": NUM_WORKERS,
+            "pin_memory": PIN_MEMORY,
             "sequence_length": SEQ_LEN,
             "learning_rate": self.learning_rate,
             "log_interval": self.log_interval,

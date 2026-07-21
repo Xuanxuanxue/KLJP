@@ -12,6 +12,8 @@ CONTRA_ROOT = Path(__file__).resolve().parents[1] / "contra"
 sys.path.insert(0, str(CONTRA_ROOT))
 
 import models.el_trans as el_trans  # noqa: E402
+from models.cnn_trans import CNN_Encoder  # noqa: E402
+from masking import masked_mean_pool  # noqa: E402
 
 
 class DummyElectra(nn.Module):
@@ -43,8 +45,8 @@ class EncoderDecoderTest(unittest.TestCase):
             [True, True],
         )
         charge_details = detail_batch(
-            [[6, 7, 0, 0], [1, 0, 0, 0], [8, 9, 10, 0]],
-            [[1, 1, 0, 0], [1, 0, 0, 0], [1, 1, 1, 0]],
+            [[6, 7, 0, 0], [0, 0, 0, 0], [8, 9, 10, 0]],
+            [[1, 1, 0, 0], [0, 0, 0, 0], [1, 1, 1, 0]],
             [True, False, True],
         )
         with patch.object(
@@ -115,6 +117,44 @@ class EncoderDecoderTest(unittest.TestCase):
         torch.testing.assert_close(
             baseline["article"], changed_padding["article"], atol=1e-6, rtol=1e-6
         )
+
+    def test_masked_mean_pool_ignores_padding_and_handles_empty_rows(self):
+        sequence = torch.tensor(
+            [[[1.0, 3.0], [3.0, 5.0], [99.0, 99.0]],
+             [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]]
+        )
+        valid_mask = torch.tensor([[True, True, False], [False, False, False]])
+
+        pooled = masked_mean_pool(sequence, valid_mask)
+
+        torch.testing.assert_close(pooled[0], torch.tensor([2.0, 4.0]))
+        torch.testing.assert_close(pooled[1], torch.zeros(2))
+
+    def test_fully_masked_fact_is_rejected(self):
+        model = self.build_model().eval()
+        with self.assertRaisesRegex(ValueError, "fully masked samples"):
+            model(
+                {
+                    "justice": {
+                        "input_ids": torch.zeros((1, 6), dtype=torch.long),
+                        "attention_mask": torch.zeros((1, 6), dtype=torch.long),
+                    }
+                }
+            )
+
+    def test_cnn_mask_prevents_padding_values_from_leaking(self):
+        encoder = CNN_Encoder(hid_dim=4, dropout=0.0, num_layers=2).eval()
+        padding_mask = torch.tensor([[False, False, True, True]])
+        baseline = torch.randn(1, 4, 4)
+        changed = baseline.clone()
+        changed[:, 2:] = 1000.0
+
+        with torch.no_grad():
+            baseline_output = encoder(baseline, padding_mask)
+            changed_output = encoder(changed, padding_mask)
+
+        torch.testing.assert_close(baseline_output, changed_output)
+        self.assertTrue(changed_output[:, 2:].eq(0).all())
 
 
 if __name__ == "__main__":

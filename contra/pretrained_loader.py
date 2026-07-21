@@ -2,26 +2,32 @@
 
 from pathlib import Path
 
-from setting import ELECTRA_MODEL_NAME, LOCAL_ELECTRA_MODEL_PATH
+from setting import (ALLOW_MODEL_DOWNLOAD, ELECTRA_MODEL_NAME,
+                     LOCAL_ELECTRA_MODEL_PATH, RUNTIME_MODE)
 
 
 def electra_sources():
-    """Return local-first then Hugging Face sources for the Electra model."""
+    """Return permitted Electra sources in priority order."""
     local_path = Path(LOCAL_ELECTRA_MODEL_PATH)
-    if local_path.is_dir():
-        yield str(local_path)
-    yield ELECTRA_MODEL_NAME
+    yield str(local_path), True
+    if ALLOW_MODEL_DOWNLOAD:
+        yield ELECTRA_MODEL_NAME, False
 
 
 def get_electra_source():
     """Return the source that will normally be selected for logging/config."""
-    return next(electra_sources())
+    local_path = Path(LOCAL_ELECTRA_MODEL_PATH)
+    if local_path.is_dir() or not ALLOW_MODEL_DOWNLOAD:
+        return str(local_path)
+    return ELECTRA_MODEL_NAME
 
 
 def _load_with_fallback(loader, component_name):
     errors = []
-    for source in electra_sources():
-        source_is_local = Path(source).is_dir()
+    for source, source_is_local in electra_sources():
+        if source_is_local and not Path(source).is_dir():
+            errors.append(f"{source}: local directory does not exist")
+            continue
         try:
             kwargs = {"local_files_only": True} if source_is_local else {}
             component = loader(source, **kwargs)
@@ -33,7 +39,9 @@ def _load_with_fallback(loader, component_name):
     detail = "\n".join(errors)
     raise OSError(
         "Unable to load the Electra "
-        f"{component_name.lower()}. Tried these sources:\n{detail}"
+        f"{component_name.lower()} in {RUNTIME_MODE} mode. "
+        f"Model downloads are {'enabled' if ALLOW_MODEL_DOWNLOAD else 'disabled'}. "
+        f"Tried these sources:\n{detail}"
     )
 
 

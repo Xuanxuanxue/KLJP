@@ -108,6 +108,12 @@ class Transformer(nn.Module):
                     "padding mask must have shape (batch_size, sequence_length), "
                     f"got {tuple(mask.shape)} for source {tuple(src.shape)}"
                 )
+            fully_masked = mask.all(dim=1)
+            if fully_masked.any():
+                indices = fully_masked.nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(
+                    f"source contains fully masked samples at indices {indices}"
+                )
 
         
         if self.num_encoder_layers > 0:

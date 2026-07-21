@@ -4,6 +4,8 @@ from transformers import AutoTokenizer, AutoModel
 from setting import ADD_ATTN, BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEVICE, LCM, ADD_DETAILS, ADD_CNN
 from transformer import Transformer
 from position_encoding import PostionalEncoding
+from masking import (masked_mean_pool, normalize_attention_mask,
+                     require_nonempty_rows, safe_key_padding_mask)
 import math
 import torch.nn.functional as F
 # from decoder import TransformerDecoder
@@ -16,11 +18,15 @@ class CNN_Encoder(nn.Module):
         self.conv = nn.ModuleList([nn.Conv1d(hid_dim, hid_dim, kernel_size,
                                       padding=kernel_size // 2) for _ in range(num_layers)])
         self.scale=torch.sqrt(torch.FloatTensor([hid_dim])).to(DEVICE)
-    def forward(self, src):
+    def forward(self, src, padding_mask=None):
+        if padding_mask is not None:
+            src = src.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         src = self.dropout(src)
         cnn = src.transpose(1, 2)
         for i, layer in enumerate(self.conv):
-            cnn = F.tanh(layer(cnn)+cnn)        
+            cnn = F.tanh(layer(cnn)+cnn)
+            if padding_mask is not None:
+                cnn = cnn.masked_fill(padding_mask.unsqueeze(1), 0.0)
         return cnn.transpose(1,2)
 
 class CNN_Trans(nn.Module):
@@ -86,15 +92,24 @@ class CNN_Trans(nn.Module):
                 f"got {input_ids.shape[0]}"
             )
         attention_mask = tokenized_details.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = input_ids.ne(0).long()
+        attention_mask = normalize_attention_mask(
+            input_ids, attention_mask, name=f"{name} details"
+        )
         present_mask = tokenized_details.get("detail_present_mask")
         if present_mask is None:
             present_mask = torch.ones(expected_count, dtype=torch.bool)
+        elif present_mask.shape != (expected_count,):
+            raise ValueError(
+                f"{name} detail_present_mask must have shape ({expected_count},), "
+                f"got {tuple(present_mask.shape)}"
+            )
+        present_mask = present_mask.to(
+            device=attention_mask.device, dtype=torch.bool
+        ) & attention_mask.any(dim=1)
 
         self.register_buffer(f"{name}_details", input_ids.clone())
         self.register_buffer(
-            f"{name}_detail_attention_mask", attention_mask.clone().bool()
+            f"{name}_detail_attention_mask", attention_mask.clone()
         )
         self.register_buffer(
             f"{name}_missing_indices",
@@ -108,7 +123,13 @@ class CNN_Trans(nn.Module):
                 raise ValueError("input_ids must contain at least one view")
             view_count = len(text)
             text = torch.cat(list(text), dim=0)
-            if attention_mask is not None:
+            if isinstance(attention_mask, (list, tuple)):
+                if len(attention_mask) != view_count:
+                    raise ValueError(
+                        "attention_mask view count must match input_ids view count"
+                    )
+                attention_mask = torch.cat(list(attention_mask), dim=0)
+            elif attention_mask is not None:
                 attention_mask = torch.cat([attention_mask] * view_count, dim=0)
         return text, attention_mask
 
@@ -143,15 +164,15 @@ class CNN_Trans(nn.Module):
             missing_indices = self.article_missing_indices
             fill_values = self.fill_article
 
-        padding_mask = ~attention_mask
+        padding_mask = safe_key_padding_mask(attention_mask)
         enc_details = self.embedding(details)  
+        enc_details = enc_details.masked_fill(
+            (~attention_mask).unsqueeze(-1), 0.0
+        )
         enc_details = self.transformer_enc(
             enc_details, src_key_padding_mask=padding_mask
         )
-        enc_details = enc_details.masked_fill(
-            padding_mask.unsqueeze(-1), torch.finfo(enc_details.dtype).min
-        )
-        enc_details = torch.max(enc_details, dim=1).values
+        enc_details = masked_mean_pool(enc_details, attention_mask)
         if missing_indices.numel() > 0:
             enc_details = enc_details.index_copy(0, missing_indices, fill_values)
         label_emb = enc_details.unsqueeze(0).repeat(batch_size,1,1)
@@ -172,14 +193,15 @@ class CNN_Trans(nn.Module):
             fact_text, attention_mask
         )
         batch_size=fact_text.shape[0]
-        padding_mask = (
-            attention_mask.eq(0) if attention_mask is not None
-            else fact_text.eq(0)
+        valid_token_mask = normalize_attention_mask(
+            fact_text, attention_mask, name="fact"
         )
+        require_nonempty_rows(valid_token_mask, name="fact")
+        padding_mask = ~valid_token_mask
 
         # enc_src = self.enc(fact_text)
         embedding = self.embedding(fact_text)
-        enc_src = self.CNN(embedding)
+        enc_src = self.CNN(embedding, padding_mask=padding_mask)
         # char_context=char_context.unsqueeze(1).repeat(1,self.max_length,1) + enc_src
         # art_context=art_context.unsqueeze(1).repeat(1,self.max_length,1) + enc_src
         # char_context = torch.cat((enc_src, char_context), dim=-1)
