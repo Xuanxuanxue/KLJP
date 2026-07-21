@@ -1,0 +1,33 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Training outputs and model artifacts
+logs/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Datasets and large archives
+KLJP-DATA/
+data/
+dataset/
+*.tar.gz
+*.zip
+
+# Machine-specific configuration and IDE files
+.env
+config/local.yaml
+config/server.yaml
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
