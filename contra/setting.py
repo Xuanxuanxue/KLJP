@@ -55,6 +55,31 @@ LCM = False
 CONTRASTIVE = False
 CONTRA_WAY = "supcon2" #"r-drop","supcon2","supcon"
 
+# Static GJudge confusion-graph augmentation.  It is off by default so E0
+# remains the original K-LJP model.  The two per-task flags make E1/E2/E3
+# ablations possible without touching the static A2C/C2A mappings.
+USE_CONFUSION_GRAPH = os.environ.get("KLJP_USE_CONFUSION_GRAPH", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+USE_ARTICLE_CONFUSION_GRAPH = os.environ.get(
+    "KLJP_USE_ARTICLE_CONFUSION_GRAPH",
+    "1" if USE_CONFUSION_GRAPH else "0",
+).lower() in {"1", "true", "yes", "on"}
+USE_CHARGE_CONFUSION_GRAPH = os.environ.get(
+    "KLJP_USE_CHARGE_CONFUSION_GRAPH",
+    "1" if USE_CONFUSION_GRAPH else "0",
+).lower() in {"1", "true", "yes", "on"}
+CONFUSION_GRAPH_THRESHOLD = float(
+    os.environ.get("KLJP_CONFUSION_GRAPH_THRESHOLD", "0.80")
+)
+CONFUSION_GRAPH_WEIGHT = float(
+    os.environ.get("KLJP_CONFUSION_GRAPH_WEIGHT", "0.10")
+)
+CONFUSION_GRAPH_HEADS = int(os.environ.get("KLJP_CONFUSION_GRAPH_HEADS", "4"))
+CONFUSION_GRAPH_DROPOUT = float(
+    os.environ.get("KLJP_CONFUSION_GRAPH_DROPOUT", "0.10")
+)
+
 DEVICE = torch.device(
     os.environ.get(
         "KLJP_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu"

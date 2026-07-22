@@ -1,7 +1,12 @@
 import torch.nn as nn
 import torch
 from transformers import AutoTokenizer, AutoModel
-from setting import ADD_ATTN, BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEVICE, LCM, ADD_DETAILS, ADD_CNN
+from setting import (ADD_ATTN, BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEVICE, LCM,
+                     ADD_DETAILS, ADD_CNN, CACHE_ROOT,
+                     USE_ARTICLE_CONFUSION_GRAPH, USE_CHARGE_CONFUSION_GRAPH,
+                     CONFUSION_GRAPH_THRESHOLD, CONFUSION_GRAPH_WEIGHT,
+                     CONFUSION_GRAPH_HEADS, CONFUSION_GRAPH_DROPOUT)
+from confusion_graph import ConfusionGraphMixin
 from transformer import Transformer
 from position_encoding import PostionalEncoding
 from masking import (masked_mean_pool, normalize_attention_mask,
@@ -29,8 +34,11 @@ class CNN_Encoder(nn.Module):
                 cnn = cnn.masked_fill(padding_mask.unsqueeze(1), 0.0)
         return cnn.transpose(1,2)
 
-class CNN_Trans(nn.Module):
-    def __init__(self, vocab_size=5000, emb_dim=300, hid_dim=128, max_length=512, maps=None, article_details=None, charge_details=None) -> None:
+class CNN_Trans(ConfusionGraphMixin, nn.Module):
+    def __init__(self, vocab_size=5000, emb_dim=300, hid_dim=128, max_length=512,
+                 maps=None, article_details=None, charge_details=None,
+                 article_cooccurrence=None, charge_cooccurrence=None,
+                 confusion_graph_cache_dir=CACHE_ROOT) -> None:
         super().__init__()
         self.emb_dim = emb_dim
         self.vocab_size = vocab_size
@@ -83,6 +91,19 @@ class CNN_Trans(nn.Module):
         else:
             self.label_emb_art = nn.Embedding(len(maps["article2idx"]), hid_dim)
             self.label_emb_char = nn.Embedding(len(maps["charge2idx"]), hid_dim)
+
+        self.setup_confusion_graphs(
+            maps=maps,
+            article_cooccurrence=article_cooccurrence,
+            charge_cooccurrence=charge_cooccurrence,
+            cache_dir=confusion_graph_cache_dir,
+            use_article=USE_ARTICLE_CONFUSION_GRAPH,
+            use_charge=USE_CHARGE_CONFUSION_GRAPH,
+            threshold=CONFUSION_GRAPH_THRESHOLD,
+            weight=CONFUSION_GRAPH_WEIGHT,
+            heads=CONFUSION_GRAPH_HEADS,
+            dropout=CONFUSION_GRAPH_DROPOUT,
+        )
 
     def _register_detail_inputs(self, name, tokenized_details, expected_count):
         input_ids = tokenized_details["input_ids"]
@@ -228,6 +249,12 @@ class CNN_Trans(nn.Module):
         # pos=torch.arange(0,src_len).unsqueeze(0).repeat(batch_size,1).to(DEVICE)
         # pos_emb = self.pos_embedding(pos).to(DEVICE)
         pos_emb = self.pos_embedding(fact_text)
+
+        # Graph enhancement occurs once, immediately before decoder calls.
+        # Shapes: article/charge labels are (batch, num_labels, hid_dim).
+        art_label_emb, char_label_emb = self.apply_confusion_graphs(
+            art_label_emb, char_label_emb
+        )
 
         char_hs = self.transformer_char_dec(
             char_context, char_label_emb, pos_emb, mask=padding_mask

@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from contrastive_loss import SupConLoss, SupConLoss2, contrastive_loss
 from dataloader2 import load_details, simple_load_multi_data
+from confusion_graph import build_training_cooccurrence
 # from el_trans import Electra, ProjectionHead
 from models.attention_xml import Hybrid_XML
 from models.cnn_trans import CNN_Trans
@@ -29,6 +30,10 @@ from setting import (BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEV_FILE, DEVICE,
                      PROJECT_ROOT, LOG_ROOT, NUM_WORKERS, PIN_MEMORY,
                      RUNTIME_MODE, RUNTIME_MODE_REASON, DATA_ROOT,
                      LOCAL_ELECTRA_MODEL_PATH, ALLOW_MODEL_DOWNLOAD, CACHE_ROOT)
+from setting import (USE_CONFUSION_GRAPH, USE_ARTICLE_CONFUSION_GRAPH,
+                     USE_CHARGE_CONFUSION_GRAPH, CONFUSION_GRAPH_THRESHOLD,
+                     CONFUSION_GRAPH_WEIGHT, CONFUSION_GRAPH_HEADS,
+                     CONFUSION_GRAPH_DROPOUT)
 from sklearn.metrics import (classification_report, f1_score, jaccard_score,
                              multilabel_confusion_matrix,
                              precision_recall_fscore_support)
@@ -158,6 +163,21 @@ class Trainer:
         # self.tokenizer_view=BertTokenizer.from_pretrained("bert-base-chinese")
         
         article_details, charge_details=load_details(self.maps, article_details_path, charge_details_path, self.art_details_len, self.charge_details_len,EMBEDDING_PATH)
+        article_cooccurrence = None
+        charge_cooccurrence = None
+        if MODEL in ("Al_Trans", "CNN_Trans") and (
+            USE_ARTICLE_CONFUSION_GRAPH or USE_CHARGE_CONFUSION_GRAPH
+        ):
+            # This is intentionally sourced from TRAIN_FILE only.  No valid or
+            # test labels enter either static confusion graph.
+            if USE_ARTICLE_CONFUSION_GRAPH:
+                article_cooccurrence = build_training_cooccurrence(
+                    TRAIN_FILE, self.maps["article2idx"], "article"
+                )
+            if USE_CHARGE_CONFUSION_GRAPH:
+                charge_cooccurrence = build_training_cooccurrence(
+                    TRAIN_FILE, self.maps["charge2idx"], "charge"
+                )
         if MODEL=="TextCNN":
             self.model=TextCNN(self.tokenizer_view.vocab_size,emb_dim=256,hid_dim=256,maps=self.maps, embedding_path=EMBEDDING_PATH).to(DEVICE)
         elif MODEL=="LSTM":
@@ -169,9 +189,23 @@ class Trainer:
         elif MODEL=="Electra":
             self.model = Electra(self.tokenizer_view.vocab_size,emb_dim=256,hid_dim=256,maps=self.maps, article_details=article_details, charge_details=charge_details).to(DEVICE)
         elif MODEL=="Al_Trans":
-            self.model = Al_Trans(self.tokenizer_view.vocab_size,emb_dim=256,hid_dim=256,maps=self.maps, article_details=article_details, charge_details=charge_details).to(DEVICE)
+            self.model = Al_Trans(
+                self.tokenizer_view.vocab_size, emb_dim=256, hid_dim=256,
+                maps=self.maps, article_details=article_details,
+                charge_details=charge_details,
+                article_cooccurrence=article_cooccurrence,
+                charge_cooccurrence=charge_cooccurrence,
+                confusion_graph_cache_dir=CACHE_ROOT,
+            ).to(DEVICE)
         elif MODEL=="CNN_Trans":
-            self.model = CNN_Trans(self.tokenizer_view.vocab_size,emb_dim=256,hid_dim=256,maps=self.maps, article_details=article_details, charge_details=charge_details).to(DEVICE)
+            self.model = CNN_Trans(
+                self.tokenizer_view.vocab_size, emb_dim=256, hid_dim=256,
+                maps=self.maps, article_details=article_details,
+                charge_details=charge_details,
+                article_cooccurrence=article_cooccurrence,
+                charge_cooccurrence=charge_cooccurrence,
+                confusion_graph_cache_dir=CACHE_ROOT,
+            ).to(DEVICE)
         elif MODEL=="Attention_XML":
             self.model = Hybrid_XML(vocab_size=self.tokenizer_view.vocab_size,embedding_size=256,hidden_size=256,maps=self.maps).to(DEVICE)
         if HEAD:
@@ -182,6 +216,7 @@ class Trainer:
         self.learning_rate = 1e-4
         self.optimizer=torch.optim.Adam(self.model.parameters(),lr=self.learning_rate)
         self._write_config(parameter_count)
+        self._log_confusion_graphs()
         self.train_logger.info(
             "初始化完成 | model=%s | parameters=%d | device=%s | "
             "mode=%s | epochs=%d | batch_size=%d | train/valid/test=%d/%d/%d",
@@ -215,6 +250,16 @@ class Trainer:
             "sequence_length": SEQ_LEN,
             "learning_rate": self.learning_rate,
             "log_interval": self.log_interval,
+            "confusion_graph": {
+                "use_confusion_graph": USE_CONFUSION_GRAPH,
+                "use_article_confusion_graph": USE_ARTICLE_CONFUSION_GRAPH,
+                "use_charge_confusion_graph": USE_CHARGE_CONFUSION_GRAPH,
+                "threshold": CONFUSION_GRAPH_THRESHOLD,
+                "weight": CONFUSION_GRAPH_WEIGHT,
+                "heads": CONFUSION_GRAPH_HEADS,
+                "dropout": CONFUSION_GRAPH_DROPOUT,
+                "stats": getattr(self.model, "confusion_graph_stats", {}),
+            },
             "parameter_count": parameter_count,
             "dataset_size": {
                 "train": len(self.train_set),
@@ -229,6 +274,22 @@ class Trainer:
         }
         with open(self.run_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
+
+    def _log_confusion_graphs(self):
+        self.train_logger.info("USE_CONFUSION_GRAPH=%s", USE_CONFUSION_GRAPH)
+        self.train_logger.info(
+            "CONFUSION_GRAPH_THRESHOLD=%s | CONFUSION_GRAPH_WEIGHT=%s",
+            CONFUSION_GRAPH_THRESHOLD, CONFUSION_GRAPH_WEIGHT,
+        )
+        for name in ("article", "charge"):
+            stats = getattr(self.model, "confusion_graph_stats", {}).get(name)
+            if stats is None:
+                continue
+            self.train_logger.info(
+                "%s graph node count=%d | edge count=%d | average degree=%.6f | isolated node count=%d",
+                name, stats["node_count"], stats["edge_count"],
+                stats["average_degree"], stats["isolated_node_count"],
+            )
 
     def log_event(self, phase, **values):
         record = {
@@ -757,6 +818,19 @@ class Trainer:
         sentences_id = []
         if save_path is not None:
             model=torch.load(save_path).to(DEVICE)
+            missing_graph_modules = []
+            if USE_ARTICLE_CONFUSION_GRAPH and not hasattr(model, "article_confusion_encoder"):
+                missing_graph_modules.append("article_confusion_encoder")
+            if USE_CHARGE_CONFUSION_GRAPH and not hasattr(model, "charge_confusion_encoder"):
+                missing_graph_modules.append("charge_confusion_encoder")
+            if missing_graph_modules:
+                message = (
+                    "混淆图已启用，但 checkpoint 缺少图模块参数/结构："
+                    + ", ".join(missing_graph_modules)
+                    + "。这可能是旧版 K-LJP checkpoint；请使用启用图模块的 checkpoint。"
+                )
+                warnings.warn(message, RuntimeWarning)
+                self.test_logger.warning(message)
         bat_cnt=0
         for data in tqdm(self.test_iter):
             bat_cnt+=1
