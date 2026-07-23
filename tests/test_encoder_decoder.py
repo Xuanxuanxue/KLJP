@@ -66,6 +66,10 @@ class EncoderDecoderTest(unittest.TestCase):
 
     def test_forward_backward_with_two_views(self):
         model = self.build_model()
+        self.assertTrue(model.fc_charge.bias)
+        self.assertTrue(model.fc_article.bias)
+        self.assertIsNotNone(model.fc_charge.b)
+        self.assertIsNotNone(model.fc_article.b)
         view = torch.tensor([[11, 12, 13, 0, 0, 0]])
         data = {
             "justice": {

@@ -5,12 +5,13 @@ from setting import (ADD_ATTN, BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEVICE, LCM,
                      ADD_DETAILS, ADD_CNN, CACHE_ROOT,
                      USE_ARTICLE_CONFUSION_GRAPH, USE_CHARGE_CONFUSION_GRAPH,
                      CONFUSION_GRAPH_THRESHOLD, CONFUSION_GRAPH_WEIGHT,
-                     CONFUSION_GRAPH_HEADS, CONFUSION_GRAPH_DROPOUT)
+                     CONFUSION_GRAPH_HEADS, CONFUSION_GRAPH_DROPOUT,
+                     CONFUSION_GRAPH_TOPK, ARTICLE_GRAPH_ALPHA, CHARGE_GRAPH_ALPHA)
 from confusion_graph import ConfusionGraphMixin
 from transformer import Transformer
 from position_encoding import PostionalEncoding
-from masking import (masked_mean_pool, normalize_attention_mask,
-                     require_nonempty_rows, safe_key_padding_mask)
+from masking import (normalize_attention_mask, require_nonempty_rows,
+                     safe_key_padding_mask)
 import math
 import torch.nn.functional as F
 # from decoder import TransformerDecoder
@@ -76,10 +77,10 @@ class CNN_Trans(ConfusionGraphMixin, nn.Module):
 
         self.w2a=nn.Parameter(torch.zeros(hid_dim,hid_dim))
         self.w2c=nn.Parameter(torch.zeros(hid_dim,hid_dim))
-        # Equation (2): y_hat_ij = sigmoid(W_ij^T h_i).
-        # The paper does not add a predictor bias term.
-        self.fc_article = GroupWiseLinear(len(maps["article2idx"]), hid_dim, bias=False)
-        self.fc_charge = GroupWiseLinear(len(maps["charge2idx"]), hid_dim, bias=False)
+        # Restore the original baseline's per-label predictor bias so the
+        # graph ablation differs from E0 only by the graph encoder.
+        self.fc_article = GroupWiseLinear(len(maps["article2idx"]), hid_dim, bias=True)
+        self.fc_charge = GroupWiseLinear(len(maps["charge2idx"]), hid_dim, bias=True)
         if ADD_DETAILS:
             self.transformer_enc = nn.TransformerEncoderLayer(emb_dim, nhead=8, batch_first=True)
             self.fill_article = nn.Parameter(
@@ -103,6 +104,9 @@ class CNN_Trans(ConfusionGraphMixin, nn.Module):
             weight=CONFUSION_GRAPH_WEIGHT,
             heads=CONFUSION_GRAPH_HEADS,
             dropout=CONFUSION_GRAPH_DROPOUT,
+            topk=CONFUSION_GRAPH_TOPK,
+            article_alpha=ARTICLE_GRAPH_ALPHA,
+            charge_alpha=CHARGE_GRAPH_ALPHA,
         )
 
     def _register_detail_inputs(self, name, tokenized_details, expected_count):
@@ -193,7 +197,12 @@ class CNN_Trans(ConfusionGraphMixin, nn.Module):
         enc_details = self.transformer_enc(
             enc_details, src_key_padding_mask=padding_mask
         )
-        enc_details = masked_mean_pool(enc_details, attention_mask)
+        # Restore the original K-LJP label-definition aggregation: max pool
+        # valid tokens only. Empty definitions are replaced by fill_values.
+        enc_details = enc_details.masked_fill(
+            (~attention_mask).unsqueeze(-1), torch.finfo(enc_details.dtype).min
+        )
+        enc_details = torch.max(enc_details, dim=1).values
         if missing_indices.numel() > 0:
             enc_details = enc_details.index_copy(0, missing_indices, fill_values)
         label_emb = enc_details.unsqueeze(0).repeat(batch_size,1,1)
@@ -269,7 +278,8 @@ class CNN_Trans(ConfusionGraphMixin, nn.Module):
             "article": out_article,
             "charge": out_charge,
             "char_enc": char_hs,
-            "art_enc": art_hs
+            "art_enc": art_hs,
+            "graph_loss": self.confusion_graph_loss,
             # "penalty": out_penalty
         }
     

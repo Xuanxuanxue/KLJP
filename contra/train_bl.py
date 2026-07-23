@@ -33,7 +33,8 @@ from setting import (BATCH_SIZE, CONTRA_WAY, CONTRASTIVE, DEV_FILE, DEVICE,
 from setting import (USE_CONFUSION_GRAPH, USE_ARTICLE_CONFUSION_GRAPH,
                      USE_CHARGE_CONFUSION_GRAPH, CONFUSION_GRAPH_THRESHOLD,
                      CONFUSION_GRAPH_WEIGHT, CONFUSION_GRAPH_HEADS,
-                     CONFUSION_GRAPH_DROPOUT)
+                     CONFUSION_GRAPH_DROPOUT, CONFUSION_GRAPH_TOPK,
+                     ARTICLE_GRAPH_ALPHA, CHARGE_GRAPH_ALPHA, LAMBDA_GRAPH)
 from sklearn.metrics import (classification_report, f1_score, jaccard_score,
                              multilabel_confusion_matrix,
                              precision_recall_fscore_support)
@@ -258,6 +259,10 @@ class Trainer:
                 "weight": CONFUSION_GRAPH_WEIGHT,
                 "heads": CONFUSION_GRAPH_HEADS,
                 "dropout": CONFUSION_GRAPH_DROPOUT,
+                "topk": CONFUSION_GRAPH_TOPK,
+                "article_alpha": ARTICLE_GRAPH_ALPHA,
+                "charge_alpha": CHARGE_GRAPH_ALPHA,
+                "lambda_graph": LAMBDA_GRAPH,
                 "stats": getattr(self.model, "confusion_graph_stats", {}),
             },
             "parameter_count": parameter_count,
@@ -280,6 +285,12 @@ class Trainer:
         self.train_logger.info(
             "CONFUSION_GRAPH_THRESHOLD=%s | CONFUSION_GRAPH_WEIGHT=%s",
             CONFUSION_GRAPH_THRESHOLD, CONFUSION_GRAPH_WEIGHT,
+        )
+        self.train_logger.info(
+            "ARTICLE_GRAPH_ALPHA=%s | CHARGE_GRAPH_ALPHA=%s | "
+            "CONFUSION_GRAPH_TOPK=%s | LAMBDA_GRAPH=%s",
+            ARTICLE_GRAPH_ALPHA, CHARGE_GRAPH_ALPHA,
+            CONFUSION_GRAPH_TOPK, LAMBDA_GRAPH,
         )
         for name in ("article", "charge"):
             stats = getattr(self.model, "confusion_graph_stats", {}).get(name)
@@ -490,12 +501,14 @@ class Trainer:
         loss_vals_eval = []
         art_loss_vals = []
         art_loss_vals_eval = []
-        best_score=0
+        best_score=-float("inf")
+        best_model_path = None
         self.train_logger.info("训练开始，共 %d 个 epoch", self.epochs)
         for epoch in range(self.epochs):
             epoch_loss= []
             train_cnt=0
             art_epoch_loss= []
+            graph_epoch_loss = []
             self.train_logger.info("Epoch %d/%d 开始训练", epoch + 1, self.epochs)
             tq = tqdm(self.train_iter)
             for data in tq:
@@ -524,8 +537,13 @@ class Trainer:
                 charge=data["charge"].to(DEVICE)
                 article=data["article"].to(DEVICE)
 
-                loss=criteria2(out["charge"].float(),charge.float())
-                art_loss=criteria2(out["article"].float(),article.float())
+                charge_loss=criteria2(out["charge"].float(),charge.float())
+                article_loss=criteria2(out["article"].float(),article.float())
+                loss = charge_loss
+                art_loss = article_loss
+                graph_loss = out.get(
+                    "graph_loss", out["charge"].sum() * 0.0
+                )
 
                 if CONTRASTIVE:
                     # 输出logits对比
@@ -557,25 +575,26 @@ class Trainer:
                     loss = loss+  loss_al_c
                     art_loss = art_loss +  loss_al_a
 
-                loss+=art_loss
+                total_loss = loss + art_loss + LAMBDA_GRAPH * graph_loss
                 s_p, s_r, s_f, s_j,m_p, m_r, m_f, m_j, _=self.calculate_threshold2(out["charge"],charge)
                 s_p_art, s_r_art, s_f_art, s_j_art,m_p_art, m_r_art, m_f_art, m_j_art, _=self.calculate_threshold2(out["article"],article)
 
-                loss.backward()
-                epoch_loss.append(loss.item())
+                total_loss.backward()
+                epoch_loss.append(total_loss.item())
                 art_epoch_loss.append(art_loss.item())
+                graph_epoch_loss.append(graph_loss.item())
                 #4表示保留四位小数，detach()将loss从计算图里抽离出来
                 if CONTRASTIVE:
-                    tq.set_postfix(epoch=epoch,train_loss=np.around(loss.cpu().detach().numpy(),4),con_loss=np.around(con_loss.cpu().detach().numpy(),4),train_mf=m_f)
+                    tq.set_postfix(epoch=epoch,train_loss=np.around(total_loss.cpu().detach().numpy(),4),con_loss=np.around(con_loss.cpu().detach().numpy(),4),train_mf=m_f)
                 elif "al" in self.model_name:
-                    tq.set_postfix(epoch=epoch,train_loss=np.around(loss.cpu().detach().numpy(),4),losskl=np.around(losskl.cpu().detach().numpy(),4),train_mf=m_f)
+                    tq.set_postfix(epoch=epoch,train_loss=np.around(total_loss.cpu().detach().numpy(),4),losskl=np.around(losskl.cpu().detach().numpy(),4),train_mf=m_f)
                 else:
-                    tq.set_postfix(epoch=epoch,train_loss=np.around(loss.cpu().detach().numpy(),4),train_art_loss=np.around(art_loss.cpu().detach().numpy(),4),train_mf=m_f,train_art_mf=m_f_art)
+                    tq.set_postfix(epoch=epoch,train_loss=np.around(total_loss.cpu().detach().numpy(),4),train_art_loss=np.around(art_loss.cpu().detach().numpy(),4),train_mf=m_f,train_art_mf=m_f_art)
                 self.optimizer.step()
                 global_iter = epoch * len(self.train_iter) + train_cnt
                 if train_cnt%50==0:
                     self.writer.add_scalar('train_f1', 100 * m_f, global_iter)
-                    self.writer.add_scalar('loss', loss.item(), global_iter)
+                    self.writer.add_scalar('loss', total_loss.item(), global_iter)
                     self.writer.add_scalar('lr', self.optimizer.param_groups[0]['lr'], global_iter)
                 if train_cnt % self.log_interval == 0:
                     self.log_event(
@@ -583,8 +602,10 @@ class Trainer:
                         epoch=epoch + 1,
                         batch=train_cnt,
                         total_batches=len(self.train_iter),
-                        loss=float(loss.item()),
+                        charge_loss=float(charge_loss.item()),
                         article_loss=float(art_loss.item()),
+                        graph_loss=float(graph_loss.item()),
+                        total_loss=float(total_loss.item()),
                         charge_macro_f1=float(m_f),
                         article_macro_f1=float(m_f_art),
                         learning_rate=float(self.optimizer.param_groups[0]['lr']),
@@ -595,12 +616,14 @@ class Trainer:
 
             #一个epoch输出一次validation的结果
             self.train_logger.info("Epoch %d/%d 开始验证", epoch + 1, self.epochs)
+            self.model.eval()
             dev_out=[]
             valid_cnt = 0
             art_dev_out=[]
             tq = tqdm(self.dev_iter)
             epoch_loss_valid= []
             art_epoch_loss_valid= []
+            graph_epoch_loss_valid = []
             for data in tq:
                 valid_cnt+=1
                 for k in data:
@@ -625,19 +648,25 @@ class Trainer:
 
                 charge=data["charge"].to(DEVICE)
                 article=data["article"].to(DEVICE)
-                loss=criteria2(out["charge"].float(),charge.float())
-                art_loss=criteria2(out["article"].float(),article.float())
-                loss+=art_loss
+                charge_loss=criteria2(out["charge"].float(),charge.float())
+                article_loss=criteria2(out["article"].float(),article.float())
+                graph_loss = out.get(
+                    "graph_loss", out["charge"].sum() * 0.0
+                )
+                loss = charge_loss
+                art_loss = article_loss
+                total_loss = loss + art_loss + LAMBDA_GRAPH * graph_loss
 
                 s_p, s_r, s_f, s_j,m_p, m_r, m_f, m_j, _=self.calculate_threshold2(out["charge"],charge)
                 s_p_art, s_r_art, s_f_art, s_j_art,m_p_art, m_r_art, m_f_art, m_j_art, _=self.calculate_threshold2(out["article"],article)
                 dev_out.append((out["charge"],charge))
                 art_dev_out.append((out["article"],article))
 
-                epoch_loss_valid.append(loss.item())
+                epoch_loss_valid.append(total_loss.item())
                 art_epoch_loss_valid.append(art_loss.item())
+                graph_epoch_loss_valid.append(graph_loss.item())
                 # tq.set_postfix(epoch=epoch,train_k_loss=np.around(k_loss.cpu().detach().numpy(),4),train_loss=np.around(loss.cpu().detach().numpy(),4),train_precison=precision,train_recall=recall,train_F1=F1)
-                tq.set_postfix(epoch=epoch,valid_loss=np.around(loss.cpu().detach().numpy(),4),valid_sp=s_p, valid_sr=s_r,valid_sf=s_f)
+                tq.set_postfix(epoch=epoch,valid_loss=np.around(total_loss.cpu().detach().numpy(),4),valid_sp=s_p, valid_sr=s_r,valid_sf=s_f)
                 val_iter = epoch * len(self.dev_iter) + valid_cnt
                 if valid_cnt%50==0:
                     self.writer.add_scalar('val_loss', loss.item(), val_iter)
@@ -651,6 +680,15 @@ class Trainer:
             
             s_p, s_r, s_f, s_j,m_p, m_r, m_f, m_j, _=self.calculate_threshold2(pred,truth)
             s_p_art, s_r_art, s_f_art, s_j_art,m_p_art, m_r_art, m_f_art, m_j_art, _=self.calculate_threshold2(art_pred,art_truth)
+            selection_score = s_f + m_f + s_f_art + m_f_art
+
+            graph_diagnostics = getattr(self.model, "confusion_graph_diagnostics", {})
+            for name, values in graph_diagnostics.items():
+                self.train_logger.info(
+                    "%s cosine before=%.6f | after=%.6f | variance before=%.6g | after=%.6g",
+                    name, values["cosine_before"], values["cosine_after"],
+                    values["variance_before"], values["variance_after"],
+                )
 
             print("*"*10+"charge_micro"+"*"*10)
             print("valid_precision:{0:.4f},valid_recall:{1:.4f},valid_F1:{2:.4f},valid_jaccard:{3:.4f}".format(s_p, s_r, s_f, s_j))
@@ -694,6 +732,8 @@ class Trainer:
                 article_macro_recall=float(m_r_art),
                 article_macro_f1=float(m_f_art),
                 article_macro_jaccard=float(m_j_art),
+                selection_score=float(selection_score),
+                graph_loss=float(np.mean(graph_epoch_loss_valid)),
             )
             #在性能提升的情况下保存当前epoch模型,将每个epoch的validation结果输入
             save_path = self.checkpoint_dir / "model_{}.pt".format(epoch + 1)
@@ -701,8 +741,8 @@ class Trainer:
             #     f.write(str(epoch)+" epoch"+"\n")
             #     f.write("valid f1: "+str(valid_F1)+"\n")
 
-            if m_f+m_f_art>=best_score:
-                best_score=m_f+m_f_art
+            if selection_score > best_score:
+                best_score=selection_score
                 best_model_path=save_path
                 torch.save(self.model,best_model_path)
                 self.log_event(
@@ -711,6 +751,7 @@ class Trainer:
                     best_score=float(best_score),
                     path=str(best_model_path),
                 )
+            self.model.train()
             # else:
             #     self.adjust_learning_rate(self.optimizer, 0.5)
                 # self.adjust_scheduler(self.scheduler, 0.5)
@@ -720,7 +761,8 @@ class Trainer:
             "训练完成 | best_score=%.6f | best_model=%s",
             best_score, best_model_path,
         )
-        self.evaluate(save_path=best_model_path)
+        if best_model_path is not None:
+            self.evaluate(save_path=best_model_path)
 
     def decode(self, maps, token_ids):
         sent=[]
@@ -831,6 +873,9 @@ class Trainer:
                 )
                 warnings.warn(message, RuntimeWarning)
                 self.test_logger.warning(message)
+        if model is None:
+            model = self.model
+        model.eval()
         bat_cnt=0
         for data in tqdm(self.test_iter):
             bat_cnt+=1

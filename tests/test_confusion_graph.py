@@ -17,7 +17,9 @@ from confusion_graph import (  # noqa: E402
     ConfusionGraphEncoder,
     build_training_cooccurrence,
     graph_statistics,
+    keep_topk_neighbors,
     load_or_build_confusion_graph,
+    normalized_adjacency,
 )
 import models.el_trans as el_trans  # noqa: E402
 
@@ -81,16 +83,36 @@ class ConfusionGraphTest(unittest.TestCase):
 
     def test_encoder_keeps_shape_and_updates_only_graph_neighbors(self):
         torch.manual_seed(1)
-        encoder = ConfusionGraphEncoder(8, heads=4, weight=0.1, dropout=0.0)
+        encoder = ConfusionGraphEncoder(8, heads=4, weight=1.0, dropout=0.0)
         labels = torch.randn(2, 3, 8, requires_grad=True)
         adjacency = torch.tensor(
             [[False, True, False], [True, False, False], [False, False, False]]
         )
         output = encoder(labels, adjacency)
         self.assertEqual(output.shape, labels.shape)
+        # The third node is isolated.  A_hat @ H - H is exactly zero there,
+        # so the residual graph delta cannot rewrite its representation.
+        self.assertTrue(torch.equal(output[:, 2], torch.zeros_like(output[:, 2])))
         output.square().mean().backward()
         self.assertIsNotNone(labels.grad)
         self.assertTrue(torch.isfinite(labels.grad).all())
+
+    def test_normalized_adjacency_adds_self_loops_for_isolated_nodes(self):
+        adjacency = torch.tensor([[False, True, False], [True, False, False], [False, False, False]])
+        normalized = normalized_adjacency(
+            adjacency, device=torch.device("cpu"), dtype=torch.float32, name="test"
+        )
+        self.assertTrue(torch.isfinite(normalized).all())
+        self.assertTrue(torch.equal(normalized[2], torch.tensor([0.0, 0.0, 1.0])))
+
+    def test_topk_does_not_turn_zero_entries_into_edges(self):
+        adjacency = torch.tensor(
+            [[False, True, False, False], [True, False, False, False],
+             [False, False, False, False], [False, False, False, False]]
+        )
+        pruned = keep_topk_neighbors(adjacency, 3)
+        self.assertTrue(torch.equal(pruned, adjacency))
+        self.assertEqual(int(pruned.sum().item()), 2)
 
     def test_al_trans_graph_forward_backward_and_checkpoint_buffers(self):
         maps = {
@@ -123,6 +145,8 @@ class ConfusionGraphTest(unittest.TestCase):
                 charge_cooccurrence=torch.eye(3, dtype=torch.bool),
                 confusion_graph_cache_dir=temp_dir,
             )
+            model.article_graph_alpha = 0.1
+            model.charge_graph_alpha = 0.1
             output = model(
                 {
                     "justice": {
@@ -139,6 +163,15 @@ class ConfusionGraphTest(unittest.TestCase):
             self.assertTrue(torch.equal(model.charge_confusion_adj, model.charge_confusion_adj.T))
             self.assertEqual(torch.diag(model.article_confusion_adj).sum().item(), 0)
             self.assertEqual(torch.diag(model.charge_confusion_adj).sum().item(), 0)
+            model.article_graph_alpha = 0.0
+            model.charge_graph_alpha = 0.0
+            article_labels = torch.randn(2, 2, 8)
+            charge_labels = torch.randn(2, 3, 8)
+            article_after, charge_after = model.apply_confusion_graphs(
+                article_labels, charge_labels
+            )
+            self.assertTrue(torch.equal(article_after, article_labels))
+            self.assertTrue(torch.equal(charge_after, charge_labels))
             (output["charge"].mean() + output["article"].mean()).backward()
             self.assertTrue(any("confusion_encoder" in key for key in model.state_dict()))
 

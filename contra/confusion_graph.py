@@ -16,6 +16,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+GRAPH_CACHE_VERSION = 3
+
+
 def label_order_from_mapping(label2idx: Mapping[str, int]) -> list[str]:
     """Return the exact model order without changing the original mapping."""
 
@@ -101,6 +104,8 @@ def confusion_adjacency(
         raise ValueError(
             f"cooccurrence must have shape {expected_shape}, got {tuple(cooccurrence.shape)}"
         )
+    if cooccurrence.is_sparse:
+        raise TypeError("cooccurrence must be a dense tensor")
     cooccurrence = cooccurrence.to(dtype=torch.bool, device="cpu")
     cooccurrence = cooccurrence | cooccurrence.T
     semantic = semantic_adjacency(label_embeddings.cpu(), threshold)
@@ -124,6 +129,95 @@ def graph_statistics(adjacency: torch.Tensor) -> dict[str, float | int]:
     }
 
 
+def keep_topk_neighbors(adj: torch.Tensor, k: int | None) -> torch.Tensor:
+    """Keep at most ``k`` non-zero off-diagonal neighbors per node.
+
+    The graph is symmetrised after pruning.  Zero-valued entries selected by
+    ``topk`` are explicitly discarded, so a node with fewer than ``k`` real
+    neighbors does not acquire fake edges.
+    """
+
+    if adj.ndim != 2 or adj.shape[0] != adj.shape[1]:
+        raise ValueError(f"adj must be square, got {tuple(adj.shape)}")
+    if adj.is_sparse:
+        raise TypeError("confusion graph adjacency must be a dense tensor")
+    if k is None:
+        result = adj.clone()
+        result.fill_diagonal_(0)
+        return result
+    if int(k) < 0:
+        raise ValueError(f"top-k must be non-negative, got {k}")
+
+    n = adj.size(0)
+    work = adj.detach().to(dtype=torch.float32).clone()
+    work.fill_diagonal_(0)
+    if n == 0 or k == 0:
+        return torch.zeros_like(adj)
+    keep = min(int(k), n - 1)
+    values, indices = torch.topk(work, k=keep, dim=1)
+    values = values.masked_fill(values <= 0, 0)
+    new_adj = torch.zeros_like(work)
+    new_adj.scatter_(1, indices, values)
+    new_adj = torch.maximum(new_adj, new_adj.T)
+    if adj.dtype == torch.bool:
+        return new_adj.gt(0)
+    return new_adj.to(dtype=adj.dtype)
+
+
+def normalized_adjacency(
+    adjacency: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str = "graph",
+) -> torch.Tensor:
+    """Return ``D^(-1/2) (A + I) D^(-1/2)`` with explicit safety checks."""
+
+    if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
+        raise ValueError(f"{name} adjacency must be square, got {tuple(adjacency.shape)}")
+    if adjacency.is_sparse:
+        raise TypeError(f"{name} adjacency must be a dense tensor")
+    n = adjacency.size(0)
+    work_dtype = torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
+    adj = adjacency.to(device=device, dtype=work_dtype)
+    if not torch.isfinite(adj).all():
+        raise FloatingPointError(f"{name} adjacency contains nan or inf")
+    identity = torch.eye(n, device=device, dtype=work_dtype)
+    adj_hat = adj + identity
+    if n == 0:
+        return adj_hat.to(dtype=dtype)
+    degree = adj_hat.sum(dim=1)
+    if not torch.isfinite(degree).all():
+        raise FloatingPointError(f"{name} degree contains nan or inf")
+    if (degree < 1).any():
+        raise FloatingPointError(
+            f"{name} has degree < 1 after adding self-loops: {degree.min().item()}"
+        )
+    inv_sqrt_degree = degree.rsqrt()
+    normalised = inv_sqrt_degree[:, None] * adj_hat * inv_sqrt_degree[None, :]
+    nan_count = int(torch.isnan(normalised).sum().item())
+    inf_count = int(torch.isinf(normalised).sum().item())
+    if nan_count or inf_count:
+        raise FloatingPointError(
+            f"{name} normalized adjacency is invalid: nan={nan_count}, inf={inf_count}"
+        )
+    return normalised.to(dtype=dtype)
+
+
+def mean_offdiag_cosine(x: torch.Tensor) -> float:
+    """Mean pairwise cosine similarity, excluding the diagonal."""
+
+    if x.ndim != 2:
+        raise ValueError(f"x must have shape (num_labels, hidden_dim), got {tuple(x.shape)}")
+    n = x.size(0)
+    if n < 2:
+        return 0.0
+    x = F.normalize(x.float(), p=2, dim=-1)
+    sim = x @ x.T
+    mask = ~torch.eye(n, dtype=torch.bool, device=x.device)
+    return float(sim[mask].mean().item())
+
+
 def load_or_build_confusion_graph(
     *,
     cache_path: str | Path,
@@ -131,6 +225,7 @@ def load_or_build_confusion_graph(
     cooccurrence: torch.Tensor,
     threshold: float,
     label_order: Sequence[str],
+    topk: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, float | int], bool]:
     """Load a validated graph cache or build and cache it once.
 
@@ -147,10 +242,12 @@ def load_or_build_confusion_graph(
         payload = torch.load(cache_path, map_location="cpu")
         valid = (
             isinstance(payload, dict)
+            and payload.get("cache_version") == GRAPH_CACHE_VERSION
             and "adjacency" in payload
             and "threshold" in payload
             and "num_nodes" in payload
             and "label_order" in payload
+            and payload.get("topk") == (None if topk is None else int(topk))
             and int(payload["num_nodes"]) == num_nodes
             and float(payload["threshold"]) == float(threshold)
             and [str(x) for x in payload["label_order"]] == expected_order
@@ -160,14 +257,18 @@ def load_or_build_confusion_graph(
             if tuple(adjacency.shape) == (num_nodes, num_nodes):
                 adjacency = adjacency | adjacency.T
                 adjacency.fill_diagonal_(False)
+                adjacency = keep_topk_neighbors(adjacency, topk)
                 return adjacency, graph_statistics(adjacency), True
 
     adjacency = confusion_adjacency(label_embeddings, cooccurrence, threshold)
+    adjacency = keep_topk_neighbors(adjacency, topk)
     payload = {
+        "cache_version": GRAPH_CACHE_VERSION,
         "adjacency": adjacency,
         "threshold": float(threshold),
         "num_nodes": num_nodes,
         "label_order": expected_order,
+        "topk": None if topk is None else int(topk),
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, cache_path)
@@ -175,11 +276,12 @@ def load_or_build_confusion_graph(
 
 
 class ConfusionGraphEncoder(nn.Module):
-    """Small multi-head masked graph-attention residual encoder.
+    """One-layer normalized graph message encoder that returns a delta.
 
-    Input and output have shape ``(batch, num_labels, hidden_dim)``.  A
-    self-loop is added only inside the forward pass; the saved graph remains
-    diagonal-free for faithful graph statistics and cache validation.
+    Input and output have shape ``(batch, num_labels, hidden_dim)``.  The
+    returned tensor is a residual increment, not a replacement embedding.
+    Self-loops are added to the normalized adjacency, while the saved graph
+    remains diagonal-free for faithful graph statistics and cache validation.
     """
 
     def __init__(
@@ -188,6 +290,7 @@ class ConfusionGraphEncoder(nn.Module):
         heads: int = 4,
         weight: float = 0.10,
         dropout: float = 0.10,
+        name: str = "graph",
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
@@ -197,13 +300,16 @@ class ConfusionGraphEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.heads = heads
         self.head_dim = hidden_dim // heads
+        # ``weight`` is retained for checkpoint/API compatibility.  Fusion is
+        # controlled by article/charge alpha in the mixin; this is only the
+        # scale of the learned delta inside the graph encoder.
         self.weight = float(weight)
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.name = str(name)
+        # No bias: when message == H (an isolated node with only its
+        # self-loop), the residual input is zero and the delta stays zero.
+        self.delta_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self._diagnostics_logged = False
 
     def forward(self, label_embeddings: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
         if label_embeddings.ndim != 3:
@@ -218,24 +324,52 @@ class ConfusionGraphEncoder(nn.Module):
                 f"embeddings={tuple(label_embeddings.shape)}, adjacency={tuple(adjacency.shape)}"
             )
 
-        adjacency = adjacency.to(device=label_embeddings.device, dtype=torch.bool)
-        self_loop = torch.eye(num_labels, device=label_embeddings.device, dtype=torch.bool)
-        attention_mask = (adjacency | self_loop)[None, None, :, :]
+        normalised = normalized_adjacency(
+            adjacency,
+            device=label_embeddings.device,
+            dtype=label_embeddings.dtype,
+            name=self.name,
+        )
+        # A_hat includes I.  Therefore an isolated node has message == H and
+        # its delta is exactly zero before the learned projection.
+        message = torch.matmul(normalised.unsqueeze(0), label_embeddings)
+        delta = message - label_embeddings
+        delta = self.dropout(delta)
+        delta = self.delta_proj(delta)
+        delta = self.weight * delta
 
-        def split_heads(values: torch.Tensor) -> torch.Tensor:
-            return values.view(batch_size, num_labels, self.heads, self.head_dim).transpose(1, 2)
+        if not self._diagnostics_logged:
+            degree = adjacency.to(device=label_embeddings.device).sum(dim=1)
+            print(f"[{self.name} graph] adj shape:", tuple(adjacency.shape))
+            print(f"[{self.name} graph] degree min:", (degree + 1).min().item())
+            print(f"[{self.name} graph] degree max:", (degree + 1).max().item())
+            print(f"[{self.name} graph] zero degree count:", ((degree + 1) == 0).sum().item())
+            print(f"[{self.name} graph] nan count:", torch.isnan(normalised).sum().item())
+            print(f"[{self.name} graph] inf count:", torch.isinf(normalised).sum().item())
+            isolated_mask = degree == 0
+            isolated_diff = delta[:, isolated_mask].norm(dim=-1) if isolated_mask.any() else None
+            print(f"[{self.name} graph] isolated node count:", isolated_mask.sum().item())
+            print(
+                f"[{self.name} graph] isolated node mean diff:",
+                0.0 if isolated_diff is None else isolated_diff.mean().item(),
+            )
+            print(
+                f"[{self.name} graph] isolated node max diff:",
+                0.0 if isolated_diff is None else isolated_diff.max().item(),
+            )
+            self._diagnostics_logged = True
+        return delta
 
-        query = split_heads(self.q_proj(label_embeddings))
-        key = split_heads(self.k_proj(label_embeddings))
-        value = split_heads(self.v_proj(label_embeddings))
-        scores = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        scores = scores.masked_fill(~attention_mask, torch.finfo(scores.dtype).min)
-        attention = F.softmax(scores, dim=-1)
-        attention = self.dropout(attention)
-        message = torch.matmul(attention, value)
-        message = message.transpose(1, 2).contiguous().view(batch_size, num_labels, hidden_dim)
-        message = self.out_proj(message)
-        return self.layer_norm(label_embeddings + self.weight * message)
+    @staticmethod
+    def smoothness_loss(label_embeddings: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        """Optional mean squared difference over real (diagonal-free) edges."""
+
+        edges = torch.triu(adjacency.to(device=label_embeddings.device, dtype=torch.bool), diagonal=1)
+        row, col = edges.nonzero(as_tuple=True)
+        if row.numel() == 0:
+            return label_embeddings.sum() * 0.0
+        difference = label_embeddings[:, row, :] - label_embeddings[:, col, :]
+        return difference.square().mean()
 
 
 class ConfusionGraphMixin:
@@ -254,12 +388,21 @@ class ConfusionGraphMixin:
         weight: float,
         heads: int,
         dropout: float,
+        article_alpha: float = 0.0,
+        charge_alpha: float = 0.0,
+        topk: int | None = None,
     ) -> None:
         """Build/load each requested graph once during model construction."""
 
         self.use_article_confusion_graph = bool(use_article)
         self.use_charge_confusion_graph = bool(use_charge)
+        self.article_graph_alpha = float(article_alpha)
+        self.charge_graph_alpha = float(charge_alpha)
+        if self.article_graph_alpha < 0 or self.charge_graph_alpha < 0:
+            raise ValueError("confusion graph alpha must be non-negative")
         self.confusion_graph_stats: dict[str, dict[str, float | int]] = {}
+        self.confusion_graph_loss = torch.zeros(())
+        self.confusion_graph_diagnostics: dict[str, dict[str, float]] = {}
         if not (self.use_article_confusion_graph or self.use_charge_confusion_graph):
             return
 
@@ -287,10 +430,11 @@ class ConfusionGraphMixin:
                 cooccurrence=article_cooccurrence,
                 threshold=threshold,
                 label_order=article_order,
+                topk=topk,
             )
             self.register_buffer("article_confusion_adj", adjacency)
             self.article_confusion_encoder = ConfusionGraphEncoder(
-                self.hid_dim, heads=heads, weight=weight, dropout=dropout
+                self.hid_dim, heads=heads, weight=weight, dropout=dropout, name="article"
             )
             self.confusion_graph_stats["article"] = stats
 
@@ -304,10 +448,11 @@ class ConfusionGraphMixin:
                 cooccurrence=charge_cooccurrence,
                 threshold=threshold,
                 label_order=charge_order,
+                topk=topk,
             )
             self.register_buffer("charge_confusion_adj", adjacency)
             self.charge_confusion_encoder = ConfusionGraphEncoder(
-                self.hid_dim, heads=heads, weight=weight, dropout=dropout
+                self.hid_dim, heads=heads, weight=weight, dropout=dropout, name="charge"
             )
             self.confusion_graph_stats["charge"] = stats
 
@@ -332,7 +477,10 @@ class ConfusionGraphMixin:
             encoded = self.transformer_enc(
                 encoded, src_key_padding_mask=~attention_mask.to(dtype=torch.bool)
             )
-            encoded = encoded.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
+            encoded = encoded.masked_fill(
+                (~attention_mask).unsqueeze(-1), torch.finfo(encoded.dtype).min
+            )
+            encoded = torch.max(encoded, dim=1).values
             if missing_indices.numel() > 0:
                 encoded = encoded.index_copy(0, missing_indices, fill_values)
             if was_training:
@@ -344,14 +492,58 @@ class ConfusionGraphMixin:
     def apply_confusion_graphs(
         self, article_label_emb: torch.Tensor, charge_label_emb: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Enhance labels immediately before the two Transformer Decoders."""
+        """Apply independent residual graph deltas immediately before decoders."""
+
+        original_article = article_label_emb
+        original_charge = charge_label_emb
+        graph_losses = []
+        diagnostics = {}
 
         if getattr(self, "use_article_confusion_graph", False):
-            article_label_emb = self.article_confusion_encoder(
-                article_label_emb, self.article_confusion_adj
+            if self.article_graph_alpha != 0.0:
+                article_delta = self.article_confusion_encoder(
+                    original_article, self.article_confusion_adj
+                )
+                article_label_emb = original_article + self.article_graph_alpha * article_delta
+            graph_losses.append(
+                self.article_confusion_encoder.smoothness_loss(
+                    original_article, self.article_confusion_adj
+                )
+            )
+            diagnostics["article"] = self._embedding_diagnostics(
+                original_article[0], article_label_emb[0]
             )
         if getattr(self, "use_charge_confusion_graph", False):
-            charge_label_emb = self.charge_confusion_encoder(
-                charge_label_emb, self.charge_confusion_adj
+            if self.charge_graph_alpha != 0.0:
+                charge_delta = self.charge_confusion_encoder(
+                    original_charge, self.charge_confusion_adj
+                )
+                charge_label_emb = original_charge + self.charge_graph_alpha * charge_delta
+            graph_losses.append(
+                self.charge_confusion_encoder.smoothness_loss(
+                    original_charge, self.charge_confusion_adj
+                )
             )
+            diagnostics["charge"] = self._embedding_diagnostics(
+                original_charge[0], charge_label_emb[0]
+            )
+        self.confusion_graph_loss = (
+            torch.stack(graph_losses).mean()
+            if graph_losses
+            else original_article.sum() * 0.0
+        )
+        self.confusion_graph_diagnostics = diagnostics
+        if self.article_graph_alpha == 0.0:
+            assert torch.allclose(article_label_emb, original_article, atol=1e-6)
+        if self.charge_graph_alpha == 0.0:
+            assert torch.allclose(charge_label_emb, original_charge, atol=1e-6)
         return article_label_emb, charge_label_emb
+
+    @staticmethod
+    def _embedding_diagnostics(before: torch.Tensor, after: torch.Tensor) -> dict[str, float]:
+        return {
+            "cosine_before": mean_offdiag_cosine(before),
+            "cosine_after": mean_offdiag_cosine(after),
+            "variance_before": float(before.var(dim=0).mean().item()),
+            "variance_after": float(after.var(dim=0).mean().item()),
+        }

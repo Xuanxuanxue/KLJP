@@ -73,12 +73,28 @@ CONFUSION_GRAPH_THRESHOLD = float(
     os.environ.get("KLJP_CONFUSION_GRAPH_THRESHOLD", "0.80")
 )
 CONFUSION_GRAPH_WEIGHT = float(
-    os.environ.get("KLJP_CONFUSION_GRAPH_WEIGHT", "0.10")
+    os.environ.get("KLJP_CONFUSION_GRAPH_WEIGHT", "1.0")
 )
 CONFUSION_GRAPH_HEADS = int(os.environ.get("KLJP_CONFUSION_GRAPH_HEADS", "4"))
 CONFUSION_GRAPH_DROPOUT = float(
     os.environ.get("KLJP_CONFUSION_GRAPH_DROPOUT", "0.10")
 )
+CONFUSION_GRAPH_TOPK = int(os.environ.get("KLJP_CONFUSION_GRAPH_TOPK", "8"))
+ARTICLE_GRAPH_ALPHA = float(
+    os.environ.get(
+        "KLJP_ARTICLE_GRAPH_ALPHA",
+        "0.1" if USE_ARTICLE_CONFUSION_GRAPH else "0.0",
+    )
+)
+CHARGE_GRAPH_ALPHA = float(
+    os.environ.get(
+        "KLJP_CHARGE_GRAPH_ALPHA",
+        "0.1" if USE_CHARGE_CONFUSION_GRAPH else "0.0",
+    )
+)
+LAMBDA_GRAPH = float(os.environ.get("KLJP_LAMBDA_GRAPH", "0.0"))
+if ARTICLE_GRAPH_ALPHA < 0 or CHARGE_GRAPH_ALPHA < 0 or LAMBDA_GRAPH < 0:
+    raise ValueError("graph alpha and lambda_graph must be non-negative")
 
 DEVICE = torch.device(
     os.environ.get(
