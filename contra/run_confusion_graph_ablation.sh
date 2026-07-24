@@ -11,12 +11,13 @@
 #
 # 使用示例：
 #   bash contra/run_confusion_graph_ablation.sh
+#   KLJP_EXPERIMENT=5 bash contra/run_confusion_graph_ablation.sh
 #   KLJP_SEEDS="22 67" bash contra/run_confusion_graph_ablation.sh
 #   KLJP_CONFUSION_GRAPH_TOPK=5 bash contra/run_confusion_graph_ablation.sh
 #
-# 也可以指定 Python 解释器和运行模式：
+# 也可以指定 Python 解释器：
 #   PYTHON_BIN=/root/miniconda3/envs/kljp/bin/python \
-#   KLJP_MODE=local bash contra/run_confusion_graph_ablation.sh
+#   bash contra/run_confusion_graph_ablation.sh
 
 set -euo pipefail
 
@@ -27,12 +28,21 @@ TRAIN_SCRIPT="${SCRIPT_DIR}/train_bl.py"
 # 可通过环境变量覆盖 Python 解释器；默认使用 PATH 中的 python。
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# auto 会沿用项目的自动运行模式，也可以设置为 local 或 server。
-MODE="${KLJP_MODE:-auto}"
-
 # 默认只跑一个随机种子，便于快速检查配置。
 # 多随机种子示例：KLJP_SEEDS="22 67 81"。
 SEEDS="${KLJP_SEEDS:-22}"
+
+# 选择实验编号：all、1、2、3、4 或 5。
+# 默认 all；本次只做实验 5 时设置 KLJP_EXPERIMENT=5。
+EXPERIMENT="${KLJP_EXPERIMENT:-all}"
+case "${EXPERIMENT}" in
+    all|1|2|3|4|5)
+        ;;
+    *)
+        echo "错误：KLJP_EXPERIMENT 必须是 all、1、2、3、4 或 5。" >&2
+        exit 1
+        ;;
+esac
 
 # 法条图默认最多保留每个节点的 8 个邻居。
 # 可测试 3、5、8：KLJP_CONFUSION_GRAPH_TOPK=3/5/8。
@@ -62,26 +72,35 @@ run_one_experiment() {
         KLJP_LAMBDA_GRAPH="${lambda_graph}" \
         KLJP_CONFUSION_GRAPH_TOPK="${TOPK}" \
         "${PYTHON_BIN}" "${TRAIN_SCRIPT}" \
-        --mode "${MODE}" \
         --seed "${seed}"
+}
+
+run_selected_experiment() {
+    local experiment_id="$1"
+    shift
+
+    # 只有选择 all 或对应编号时才执行该实验。
+    if [[ "${EXPERIMENT}" == "all" || "${EXPERIMENT}" == "${experiment_id}" ]]; then
+        run_one_experiment "$@"
+    fi
 }
 
 for seed in ${SEEDS}; do
     # 实验 1：baseline。
     # alpha=0 且 lambda_graph=0 时，模型 forward 和损失均不受图模块影响。
-    run_one_experiment "baseline" 0 0 0.0 0.0 0.0 "${seed}"
+    run_selected_experiment 1 "baseline" 0 0 0.0 0.0 0.0 "${seed}"
 
     # 实验 2：只启用法条混淆图。
-    run_one_experiment "article_graph" 1 0 0.1 0.0 0.0 "${seed}"
+    run_selected_experiment 2 "article_graph" 1 0 0.1 0.0 0.0 "${seed}"
 
     # 实验 3：只启用罪名混淆图。
-    run_one_experiment "charge_graph" 0 1 0.0 0.1 0.0 "${seed}"
+    run_selected_experiment 3 "charge_graph" 0 1 0.0 0.1 0.0 "${seed}"
 
     # 实验 4：同时启用法条图和罪名图。
-    run_one_experiment "both_graph" 1 1 0.1 0.1 0.0 "${seed}"
+    run_selected_experiment 4 "both_graph" 1 1 0.1 0.1 0.0 "${seed}"
 
     # 实验 5：两张图开启，并加入可选图损失。
-    run_one_experiment "both_graph_loss" 1 1 0.1 0.1 0.01 "${seed}"
+    run_selected_experiment 5 "both_graph_loss" 1 1 0.1 0.1 0.01 "${seed}"
 done
 
 echo "全部混淆图消融实验完成。"

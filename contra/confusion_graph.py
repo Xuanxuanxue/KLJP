@@ -8,6 +8,7 @@ cosine similarity only; WRD can be added to ``semantic_adjacency`` later.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -276,12 +277,13 @@ def load_or_build_confusion_graph(
 
 
 class ConfusionGraphEncoder(nn.Module):
-    """One-layer normalized graph message encoder that returns a delta.
+    """One-layer pure-PyTorch masked multi-head graph-attention encoder.
 
-    Input and output have shape ``(batch, num_labels, hidden_dim)``.  The
-    returned tensor is a residual increment, not a replacement embedding.
-    Self-loops are added to the normalized adjacency, while the saved graph
-    remains diagonal-free for faithful graph statistics and cache validation.
+    Input and output have shape ``(batch, num_labels, hidden_dim)``.  Attention
+    is retained only for confusion edges and temporary self-loops.  The saved
+    graph remains diagonal-free for faithful graph statistics and cache
+    validation.  ``residual_weight`` is the task-specific lambda_g in
+    ``LayerNorm(P + lambda_g * GAT(P))``.
     """
 
     def __init__(
@@ -293,6 +295,8 @@ class ConfusionGraphEncoder(nn.Module):
         name: str = "graph",
     ) -> None:
         super().__init__()
+        if heads <= 0:
+            raise ValueError(f"graph heads must be positive, got {heads}")
         if hidden_dim % heads != 0:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must be divisible by graph heads ({heads})"
@@ -300,18 +304,23 @@ class ConfusionGraphEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.heads = heads
         self.head_dim = hidden_dim // heads
-        # ``weight`` is retained for checkpoint/API compatibility.  Fusion is
-        # controlled by article/charge alpha in the mixin; this is only the
-        # scale of the learned delta inside the graph encoder.
         self.weight = float(weight)
         self.name = str(name)
-        # No bias: when message == H (an isolated node with only its
-        # self-loop), the residual input is zero and the delta stays zero.
-        self.delta_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.attention_dropout = nn.Dropout(dropout)
+        self.output_dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         self._diagnostics_logged = False
 
-    def forward(self, label_embeddings: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        label_embeddings: torch.Tensor,
+        adjacency: torch.Tensor,
+        residual_weight: float = 1.0,
+    ) -> torch.Tensor:
         if label_embeddings.ndim != 3:
             raise ValueError(
                 "label_embeddings must have shape (batch, num_labels, hidden_dim), "
@@ -324,41 +333,78 @@ class ConfusionGraphEncoder(nn.Module):
                 f"embeddings={tuple(label_embeddings.shape)}, adjacency={tuple(adjacency.shape)}"
             )
 
-        normalised = normalized_adjacency(
-            adjacency,
-            device=label_embeddings.device,
-            dtype=label_embeddings.dtype,
-            name=self.name,
+        adjacency = adjacency.to(
+            device=label_embeddings.device, dtype=torch.bool
         )
-        # A_hat includes I.  Therefore an isolated node has message == H and
-        # its delta is exactly zero before the learned projection.
-        message = torch.matmul(normalised.unsqueeze(0), label_embeddings)
-        delta = message - label_embeddings
-        delta = self.dropout(delta)
-        delta = self.delta_proj(delta)
-        delta = self.weight * delta
+        if not torch.equal(adjacency, adjacency.T):
+            raise ValueError(f"{self.name} adjacency must be symmetric")
+        if torch.diag(adjacency).any():
+            raise ValueError(
+                f"{self.name} stored adjacency must not contain self-loops"
+            )
+
+        # Add self-loops only to the attention mask.  The registered/cached
+        # B_cr matrix itself remains diagonal-free.
+        self_loops = torch.eye(
+            num_labels, device=label_embeddings.device, dtype=torch.bool
+        )
+        attention_mask = (adjacency | self_loops)[None, None, :, :]
+
+        def split_heads(values: torch.Tensor) -> torch.Tensor:
+            # (B, N, D) -> (B, heads, N, D_head)
+            return values.reshape(
+                batch_size, num_labels, self.heads, self.head_dim
+            ).transpose(1, 2)
+
+        query = split_heads(self.q_proj(label_embeddings))
+        key = split_heads(self.k_proj(label_embeddings))
+        value = split_heads(self.v_proj(label_embeddings))
+        scores = torch.matmul(query, key.transpose(-2, -1))
+        scores = scores / math.sqrt(self.head_dim)
+        scores = scores.masked_fill(
+            ~attention_mask, torch.finfo(scores.dtype).min
+        )
+        # Computing softmax in fp32 avoids underflow in mixed-precision
+        # training; self-loops guarantee at least one valid key in every row.
+        attention = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+        dropped_attention = self.attention_dropout(attention)
+        message = torch.matmul(dropped_attention, value)
+        message = message.transpose(1, 2).contiguous().reshape(
+            batch_size, num_labels, hidden_dim
+        )
+        message = self.output_dropout(self.out_proj(message))
+
+        scale = self.weight * float(residual_weight)
+        enhanced = self.layer_norm(label_embeddings + scale * message)
 
         if not self._diagnostics_logged:
-            degree = adjacency.to(device=label_embeddings.device).sum(dim=1)
+            degree = adjacency.sum(dim=1)
             print(f"[{self.name} graph] adj shape:", tuple(adjacency.shape))
+            print(f"[{self.name} graph] encoder: masked multi-head GAT")
+            print(f"[{self.name} graph] attention heads:", self.heads)
             print(f"[{self.name} graph] degree min:", (degree + 1).min().item())
             print(f"[{self.name} graph] degree max:", (degree + 1).max().item())
-            print(f"[{self.name} graph] zero degree count:", ((degree + 1) == 0).sum().item())
-            print(f"[{self.name} graph] nan count:", torch.isnan(normalised).sum().item())
-            print(f"[{self.name} graph] inf count:", torch.isinf(normalised).sum().item())
-            isolated_mask = degree == 0
-            isolated_diff = delta[:, isolated_mask].norm(dim=-1) if isolated_mask.any() else None
-            print(f"[{self.name} graph] isolated node count:", isolated_mask.sum().item())
+            print(f"[{self.name} graph] isolated node count:", (degree == 0).sum().item())
+            print(f"[{self.name} graph] attention nan count:", torch.isnan(attention).sum().item())
+            print(f"[{self.name} graph] attention inf count:", torch.isinf(attention).sum().item())
+            valid_attention = attention.masked_select(
+                attention_mask.expand_as(attention)
+            )
+            masked_attention = attention.masked_select(
+                (~attention_mask).expand_as(attention)
+            )
+            row_sum_error = (attention.sum(dim=-1) - 1.0).abs().max()
             print(
-                f"[{self.name} graph] isolated node mean diff:",
-                0.0 if isolated_diff is None else isolated_diff.mean().item(),
+                f"[{self.name} graph] attention valid min:",
+                0.0 if valid_attention.numel() == 0 else valid_attention.min().item(),
             )
             print(
-                f"[{self.name} graph] isolated node max diff:",
-                0.0 if isolated_diff is None else isolated_diff.max().item(),
+                f"[{self.name} graph] masked attention max:",
+                0.0 if masked_attention.numel() == 0 else masked_attention.max().item(),
             )
+            print(f"[{self.name} graph] attention row-sum max error:", row_sum_error.item())
             self._diagnostics_logged = True
-        return delta
+        return enhanced
 
     @staticmethod
     def smoothness_loss(label_embeddings: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
@@ -492,7 +538,7 @@ class ConfusionGraphMixin:
     def apply_confusion_graphs(
         self, article_label_emb: torch.Tensor, charge_label_emb: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply independent residual graph deltas immediately before decoders."""
+        """Apply independent residual GAT enhancement immediately before decoders."""
 
         original_article = article_label_emb
         original_charge = charge_label_emb
@@ -501,10 +547,11 @@ class ConfusionGraphMixin:
 
         if getattr(self, "use_article_confusion_graph", False):
             if self.article_graph_alpha != 0.0:
-                article_delta = self.article_confusion_encoder(
-                    original_article, self.article_confusion_adj
+                article_label_emb = self.article_confusion_encoder(
+                    original_article,
+                    self.article_confusion_adj,
+                    residual_weight=self.article_graph_alpha,
                 )
-                article_label_emb = original_article + self.article_graph_alpha * article_delta
             graph_losses.append(
                 self.article_confusion_encoder.smoothness_loss(
                     original_article, self.article_confusion_adj
@@ -515,10 +562,11 @@ class ConfusionGraphMixin:
             )
         if getattr(self, "use_charge_confusion_graph", False):
             if self.charge_graph_alpha != 0.0:
-                charge_delta = self.charge_confusion_encoder(
-                    original_charge, self.charge_confusion_adj
+                charge_label_emb = self.charge_confusion_encoder(
+                    original_charge,
+                    self.charge_confusion_adj,
+                    residual_weight=self.charge_graph_alpha,
                 )
-                charge_label_emb = original_charge + self.charge_graph_alpha * charge_delta
             graph_losses.append(
                 self.charge_confusion_encoder.smoothness_loss(
                     original_charge, self.charge_confusion_adj

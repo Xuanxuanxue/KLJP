@@ -97,10 +97,6 @@ def setup_seed(seed):
 def set_args():
     """设置训练模型所需参数"""
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--mode', choices=('auto', 'local', 'server'), default=RUNTIME_MODE,
-        help='运行模式；auto 会根据环境自动判断，也可用 KLJP_MODE 覆盖',
-    )
     parser.add_argument('--seed', type=int, default=22, help='随机种子')
     parser.add_argument('--log-interval', type=int, default=50,
                         help='每隔多少个训练 batch 记录一次日志')

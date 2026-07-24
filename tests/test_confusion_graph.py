@@ -81,7 +81,7 @@ class ConfusionGraphTest(unittest.TestCase):
             )
             self.assertFalse(from_cache)
 
-    def test_encoder_keeps_shape_and_updates_only_graph_neighbors(self):
+    def test_encoder_keeps_shape_masks_non_neighbors_and_backpropagates(self):
         torch.manual_seed(1)
         encoder = ConfusionGraphEncoder(8, heads=4, weight=1.0, dropout=0.0)
         labels = torch.randn(2, 3, 8, requires_grad=True)
@@ -90,12 +90,20 @@ class ConfusionGraphTest(unittest.TestCase):
         )
         output = encoder(labels, adjacency)
         self.assertEqual(output.shape, labels.shape)
-        # The third node is isolated.  A_hat @ H - H is exactly zero there,
-        # so the residual graph delta cannot rewrite its representation.
-        self.assertTrue(torch.equal(output[:, 2], torch.zeros_like(output[:, 2])))
-        output.square().mean().backward()
+        self.assertTrue(torch.isfinite(output).all())
+
+        # Node 2 has only its temporary self-loop. Its output must not depend
+        # on either non-neighbor node 0 or node 1.
+        output[:, 2].sum().backward(retain_graph=True)
+        self.assertTrue(torch.equal(labels.grad[:, :2], torch.zeros_like(labels.grad[:, :2])))
+        labels.grad.zero_()
+
+        # Node 0 is connected to node 1, so its output receives a gradient
+        # through node 1's value projection.
+        output[:, 0, 0].sum().backward()
         self.assertIsNotNone(labels.grad)
         self.assertTrue(torch.isfinite(labels.grad).all())
+        self.assertGreater(labels.grad[:, 1].abs().sum().item(), 0.0)
 
     def test_normalized_adjacency_adds_self_loops_for_isolated_nodes(self):
         adjacency = torch.tensor([[False, True, False], [True, False, False], [False, False, False]])

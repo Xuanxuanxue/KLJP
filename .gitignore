@@ -27,6 +27,7 @@ dataset/
 .env
 config/local.yaml
 config/server.yaml
+*.sh
 .vscode/
 .idea/
 .DS_Store
